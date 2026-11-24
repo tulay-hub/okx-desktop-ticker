@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+settings.ini
+runtime.lock
+*.log
+*.log.*
+desktop-status.json
+*verification.json
+.env
+.env.*
+*.tmp
