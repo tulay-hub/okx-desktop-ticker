@@ -18,7 +18,7 @@ import urllib.request
 
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
-from PyQt5.QtCore import QPoint, QPointF, QRectF, QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QPoint, QPointF, QRectF, QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen
 from PyQt5.QtWidgets import (
     QActionGroup, QApplication, QComboBox, QDialog, QHBoxLayout, QLabel,
@@ -29,14 +29,16 @@ from PyQt5.QtWidgets import (
 APP_DIR = Path(__file__).resolve().parent
 API_BASE = "https://openapi.okx.com"
 INSTRUMENT = "NVDA-USDT-SWAP"
+ANTHROPIC = "ANTHROPIC-USDT-SWAP"
+COMPACT_INSTRUMENTS = (ANTHROPIC, INSTRUMENT)
 GREEN = "#7ce5bc"
 RED = "#ff8f9c"
 MUTED = "#b0b9c9"
 PRESETS = {
     "半导体": ("NVDA", "AMD", "MU", "INTC", "TSM", "AVGO", "ARM", "ASML", "SNDK",
                "SMH", "SOXX", "AMAT", "LRCX", "KLAC", "QCOM", "MRVL", "TXN", "ON"),
-    "AI 科技": ("NVDA", "MSFT", "GOOGL", "META", "AMZN", "PLTR", "ORCL", "AMD", "AVGO"),
-    "加密货币": ("BTC", "ETH", "SOL", "OKB", "XRP", "DOGE", "ADA", "BNB", "LINK", "ANT"),
+    "AI 科技": ("ANTHROPIC", "NVDA", "MSFT", "GOOGL", "META", "AMZN", "PLTR", "ORCL", "AMD", "AVGO"),
+    "加密货币": ("BTC", "ETH", "SOL", "OKB", "XRP", "DOGE", "ADA", "BNB", "LINK"),
 }
 DISPLAY_NAMES = {
     "NVDA": "英伟达", "AMD": "超威半导体", "MU": "美光", "INTC": "英特尔",
@@ -45,8 +47,12 @@ DISPLAY_NAMES = {
     "MSFT": "微软", "GOOGL": "谷歌", "META": "Meta", "AMZN": "亚马逊",
     "PLTR": "Palantir", "ORCL": "甲骨文", "BTC": "比特币", "ETH": "以太坊",
     "SOL": "Solana", "OKB": "欧易平台币", "XRP": "瑞波币", "DOGE": "狗狗币",
-    "ADA": "Cardano", "BNB": "币安币", "LINK": "Chainlink", "ANT": "Aragon",
+    "ADA": "Cardano", "BNB": "币安币", "LINK": "Chainlink", "ANTHROPIC": "Anthropic（Claude）",
 }
+
+
+def display_symbol(instrument):
+    return "ANT" if instrument == ANTHROPIC else instrument.split("-")[0]
 
 
 class InstrumentDialog(QDialog):
@@ -105,11 +111,16 @@ class InstrumentDialog(QDialog):
         else:
             candidates = [f"{symbol}-USDT-SWAP" for symbol in PRESETS[category]
                           if f"{symbol}-USDT-SWAP" in catalog]
+        if query and ANTHROPIC in candidates:
+            candidates.remove(ANTHROPIC)
+            candidates.insert(0, ANTHROPIC)
         for instrument in candidates:
-            symbol = instrument.split("-")[0]
-            name = DISPLAY_NAMES.get(symbol, "")
+            symbol = display_symbol(instrument)
+            name = DISPLAY_NAMES.get(instrument.split("-")[0], "")
             text = f"{symbol}USDT  {name}"
-            haystack = instrument.replace("-", "") + name.upper()
+            haystack = f"{instrument.replace('-', '')} {text.upper()}"
+            if instrument == ANTHROPIC:
+                haystack += " 克劳德"
             if query and query not in haystack:
                 continue
             prefix = "★  " if instrument in self.owner.watchlist else "    "
@@ -119,11 +130,6 @@ class InstrumentDialog(QDialog):
             self.items.addItem(item)
             if instrument == selected_id:
                 self.items.setCurrentItem(item)
-        if (category == "加密货币" and not query or query in ("ANT", "ANTUSDT")) \
-                and "ANT-USDT-SWAP" not in catalog and self.owner.catalog_loaded:
-            item = QListWidgetItem("ANT · Aragon（OKX 当前无可用 USDT 永续）")
-            item.setFlags(Qt.NoItemFlags)
-            self.items.addItem(item)
         if self.items.count() == 0:
             text = "没有匹配的 OKX USDT 永续合约" if self.owner.catalog_loaded else "正在加载合约列表…"
             item = QListWidgetItem(text)
@@ -225,6 +231,18 @@ def get_market_data(path):
     return payload["data"]
 
 
+def get_ticker(instrument):
+    data = get_market_data(f"/api/v5/market/ticker?instId={instrument}")[0]
+    if data.get("instId") != instrument:
+        raise ValueError("合约代码不匹配")
+    values = [float(data[key]) for key in ("last", "open24h", "high24h", "low24h")]
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        raise ValueError("行情价格无效")
+    if int(data["ts"]) <= 0:
+        raise ValueError("行情时间无效")
+    return data
+
+
 class MarketWorker(QThread):
     ticker = pyqtSignal(dict)
     candles = pyqtSignal(str, list)
@@ -235,22 +253,23 @@ class MarketWorker(QThread):
     def __init__(self, instrument, parent=None):
         super().__init__(parent)
         self.instrument = instrument
+        self.compact = False
 
     def run(self):
-        # Network activity stays off the UI thread. Only one ticker request is in flight.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             candle_request = None
             candle_instrument = None
             catalog_request = None
             next_catalog = 0.0
             next_candles = 0.0
-            next_ticker = 0.0
+            ticker_requests = {}
+            next_ticker = {}
             instrument = self.instrument
             while not self.isInterruptionRequested():
                 now = time.monotonic()
                 if instrument != self.instrument:
                     instrument = self.instrument
-                    next_candles = next_ticker = 0.0
+                    next_candles = 0.0
                 if catalog_request is not None and catalog_request.done():
                     try:
                         self.catalog_ready.emit(catalog_request.result())
@@ -276,21 +295,25 @@ class MarketWorker(QThread):
                         get_market_data,
                         f"/api/v5/market/candles?instId={instrument}&bar=1m&limit=120",
                     )
-                if now >= next_ticker:
-                    started = time.monotonic()
+                watched = set(COMPACT_INSTRUMENTS) if self.compact else {instrument}
+                for symbol, request in list(ticker_requests.items()):
+                    if not request.done():
+                        continue
+                    del ticker_requests[symbol]
+                    if symbol not in watched:
+                        next_ticker.pop(symbol, None)
+                        continue
                     try:
-                        data = get_market_data(f"/api/v5/market/ticker?instId={instrument}")[0]
-                        if data.get("instId") != instrument:
-                            raise ValueError("合约代码不匹配")
-                        values = [float(data[key]) for key in ("last", "open24h", "high24h", "low24h")]
-                        if not all(math.isfinite(value) and value > 0 for value in values):
-                            raise ValueError("行情价格无效")
-                        if int(data["ts"]) <= 0:
-                            raise ValueError("行情时间无效")
-                        self.ticker.emit(data)
+                        self.ticker.emit(request.result())
                     except Exception as error:
-                        self.failed.emit(instrument, f"{type(error).__name__}: {error}")
-                    next_ticker = max(started + 2, time.monotonic() + 0.2)
+                        self.failed.emit(symbol, f"{type(error).__name__}: {error}")
+                    next_ticker[symbol] = max(next_ticker[symbol], now + 0.2)
+                next_ticker = {symbol: due for symbol, due in next_ticker.items()
+                               if symbol in watched or symbol in ticker_requests}
+                for symbol in watched:
+                    if symbol not in ticker_requests and now >= next_ticker.get(symbol, 0):
+                        ticker_requests[symbol] = pool.submit(get_ticker, symbol)
+                        next_ticker[symbol] = now + 2
                 self.msleep(100)
 
 
@@ -489,6 +512,139 @@ class CandleChart(QWidget):
                                    card.width() - 18, 19), Qt.AlignVCenter | Qt.AlignLeft, text)
 
 
+class CompactTicker(QWidget):
+    expand_requested = pyqtSignal(str)
+
+    def __init__(self, settings):
+        super().__init__(flags=Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.settings = settings
+        self.drag_start = None
+        self.dragging = False
+        self.installEventFilter(self)
+        self.setWindowTitle("OKX 精简行情")
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+        self.quotes = {}
+        self.errors = set()
+        self.entries = {}
+        self.setObjectName("compactTicker")
+        self.setAttribute(Qt.WA_StyledBackground)
+        self.setStyleSheet(
+            "QWidget#compactTicker {background:#121c2c; border:1px solid #283a51;}"
+            "QPushButton {background:transparent; color:#eef3fb; border:0; border-radius:4px;}"
+            "QPushButton:hover,QPushButton:focus {background:#253750;}"
+            "QLabel {color:#eef3fb;}"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
+        expand = QPushButton("▤")
+        expand.setFixedSize(26, 26)
+        expand.setToolTip("点击展开当前品种 K 线，按住拖动行情条")
+        expand.setAccessibleName("展开当前品种 K 线")
+        expand.installEventFilter(self)
+        expand.clicked.connect(lambda: self.expand_requested.emit(""))
+        layout.addWidget(expand)
+        for instrument in COMPACT_INSTRUMENTS:
+            button = QPushButton()
+            button.setFixedSize(164, 26)
+            button.setAccessibleName(f"展开 {display_symbol(instrument)} K 线")
+            button.installEventFilter(self)
+            row = QHBoxLayout(button)
+            row.setContentsMargins(6, 0, 6, 0)
+            row.setSpacing(5)
+            symbol = QLabel(display_symbol(instrument))
+            symbol.setFont(QFont("Inter", 9, QFont.DemiBold))
+            price = QLabel("—")
+            change = QLabel("—")
+            for label in (symbol, price, change):
+                label.setAttribute(Qt.WA_TransparentForMouseEvents)
+                row.addWidget(label)
+            row.addStretch()
+            button.clicked.connect(lambda checked, code=instrument: self.expand_requested.emit(code))
+            self.entries[instrument] = (button, price, change)
+            layout.addWidget(button)
+        self.setFixedSize(self.sizeHint())
+        self.refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.place_strip()
+        QTimer.singleShot(150, self.place_strip)
+
+    def place_strip(self):
+        if not self.isVisible():
+            return
+        if self.drag_start is None:
+            position = self.settings.value("compact_position", type=QPoint)
+            screen = (QApplication.screenAt(position + self.rect().center())
+                      if position is not None else None)
+            if screen is None:
+                area = QApplication.primaryScreen().availableGeometry()
+                position = area.topLeft() + QPoint(8, 5)
+            else:
+                area = screen.availableGeometry()
+            position.setX(max(area.left(), min(position.x(), area.right() - self.width() + 1)))
+            position.setY(max(area.top(), min(position.y(), area.bottom() - self.height() + 1)))
+            self.move(position)
+        if QApplication.platformName() == "xcb":
+            request_topmost(int(self.winId()), True)
+
+    def eventFilter(self, watched, event):
+        event_type = event.type()
+        if event_type in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick) and event.button() == Qt.LeftButton:
+            self.drag_start = (event.globalPos(), self.pos())
+            self.dragging = False
+        elif event_type == QEvent.MouseMove and self.drag_start is not None and event.buttons() & Qt.LeftButton:
+            cursor_start, window_start = self.drag_start
+            delta = event.globalPos() - cursor_start
+            if not self.dragging and delta.manhattanLength() >= QApplication.startDragDistance():
+                self.dragging = True
+                if isinstance(watched, QPushButton):
+                    watched.setDown(False)
+            if self.dragging:
+                self.move(window_start + delta)
+                return True
+        elif event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            self.drag_start = None
+            if self.dragging:
+                self.dragging = False
+                self.settings.setValue("compact_position", self.pos())
+                self.settings.sync()
+                return True
+        return super().eventFilter(watched, event)
+
+    def receive_quote(self, instrument, quote):
+        previous = self.quotes.get(instrument)
+        if previous is None or int(quote["ts"]) >= int(previous["ts"]):
+            self.quotes[instrument] = quote
+            self.errors.discard(instrument)
+
+    def refresh(self):
+        for instrument, (button, price, change) in self.entries.items():
+            quote = self.quotes.get(instrument)
+            status = "正在连接"
+            color = MUTED
+            change_text = "—"
+            if quote:
+                price.setText(f"{float(quote['last']):,.2f}")
+                percent = (float(quote["last"]) / float(quote["open24h"]) - 1) * 100
+                color = GREEN if percent >= 0 else RED
+                arrow = "▲" if percent >= 0 else "▼"
+                change_text = f"{arrow}{abs(percent):.1f}%"
+                status = "行情延迟" if time.time() - int(quote["ts"]) / 1000 > 15 else "实时"
+            if instrument in self.errors:
+                status = "连接中断"
+            if status in ("行情延迟", "连接中断"):
+                change_text, color = "延迟" if status == "行情延迟" else "断线", "#f5cf84"
+            change.setText(change_text)
+            change.setStyleSheet(f"color:{color};")
+            button.setToolTip(f"点击展开 {display_symbol(instrument)} K 线 · {status} · 24 小时涨跌幅\n按住拖动行情条")
+
+    def closeEvent(self, event):
+        event.accept()
+        self.expand_requested.emit("")
+
+
 class TickerWindow(QWidget):
     catalog_updated = pyqtSignal()
 
@@ -513,7 +669,7 @@ class TickerWindow(QWidget):
         self.smoke_report = smoke_report
         self.snapshot_path = snapshot
         self.smoke_started = time.monotonic()
-        self.setWindowTitle(f"{self.instrument.split('-')[0]}USDT 实时悬浮行情")
+        self.setWindowTitle(f"{display_symbol(self.instrument)}USDT 实时悬浮行情")
         self.setObjectName("nvdaTicker")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -528,7 +684,7 @@ class TickerWindow(QWidget):
         layout.setSpacing(5)
         header = QHBoxLayout()
         self.symbol_button = QToolButton()
-        self.symbol_button.setText(self.instrument.split("-")[0] + "USDT  ▾")
+        self.symbol_button.setText(display_symbol(self.instrument) + "USDT  ▾")
         self.symbol_button.setStyleSheet(
             "QToolButton {font-size:14px; font-weight:600; color:#f4f7fb; padding:2px 5px;}"
             "QToolButton:hover {background:rgba(255,255,255,28);}"
@@ -544,6 +700,12 @@ class TickerWindow(QWidget):
         menu_button.setToolTip("透明度与置顶设置，也可以右键打开")
         menu_button.clicked.connect(lambda: self.show_menu(menu_button.mapToGlobal(QPoint(0, 24))))
         header.addWidget(menu_button)
+        self.compact_button = QToolButton()
+        self.compact_button.setText("−")
+        self.compact_button.setFixedSize(24, 24)
+        self.compact_button.setToolTip("缩成顶部行情条")
+        self.compact_button.clicked.connect(self.show_compact)
+        header.addWidget(self.compact_button)
         close_button = QToolButton()
         close_button.setText("×")
         close_button.setFixedSize(24, 24)
@@ -579,6 +741,8 @@ class TickerWindow(QWidget):
         for child in self.findChildren(QLabel):
             child.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.place_window()
+        self.compact_ticker = CompactTicker(self.settings)
+        self.compact_ticker.expand_requested.connect(self.restore_chart)
         self.worker = MarketWorker(self.instrument, self)
         self.worker.ticker.connect(self.receive_ticker)
         self.worker.candles.connect(self.receive_candles)
@@ -640,7 +804,7 @@ class TickerWindow(QWidget):
             return
         self.instrument = instrument
         self.settings.setValue("instrument", instrument)
-        symbol = instrument.split("-")[0] + "USDT"
+        symbol = display_symbol(instrument) + "USDT"
         self.symbol_button.setText(symbol + "  ▾")
         self.setWindowTitle(f"{symbol} 实时悬浮行情")
         self.latest_quote_ms = 0
@@ -669,7 +833,12 @@ class TickerWindow(QWidget):
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 18, 18)
 
     def receive_ticker(self, quote):
-        if quote.get("instId") != self.instrument:
+        instrument = quote.get("instId")
+        if instrument in COMPACT_INSTRUMENTS:
+            self.compact_ticker.receive_quote(instrument, quote)
+            if self.compact_ticker.isVisible():
+                self.compact_ticker.refresh()
+        if instrument != self.instrument:
             return
         timestamp = int(quote["ts"])
         if timestamp < self.latest_quote_ms:
@@ -698,6 +867,8 @@ class TickerWindow(QWidget):
         self.update_status()
 
     def receive_error(self, instrument, message):
+        if instrument in COMPACT_INSTRUMENTS:
+            self.compact_ticker.errors.add(instrument)
         if instrument != self.instrument:
             return
         if not self.network_error:
@@ -707,6 +878,8 @@ class TickerWindow(QWidget):
         self.update_status()
 
     def update_status(self):
+        if self.compact_ticker.isVisible():
+            self.compact_ticker.refresh()
         age = max(0, time.time() - self.latest_quote_ms / 1000) if self.latest_quote_ms else float("inf")
         updated = time.strftime("%H:%M:%S", time.localtime(self.latest_quote_ms / 1000))
         if self.network_error:
@@ -744,6 +917,7 @@ class TickerWindow(QWidget):
         top.setChecked(bool(self.windowFlags() & Qt.WindowStaysOnTopHint))
         top.triggered.connect(self.toggle_top)
         menu.addSeparator()
+        menu.addAction("缩成顶部行情条", self.show_compact)
         menu.addAction("关闭", self.close)
         menu.exec_(position)
 
@@ -751,6 +925,25 @@ class TickerWindow(QWidget):
         self.background_alpha = alpha
         self.settings.setValue("background_alpha", alpha)
         self.update()
+
+    def show_compact(self):
+        self.settings.setValue("position", self.pos())
+        self.worker.compact = True
+        self.compact_ticker.refresh()
+        self.compact_ticker.show()
+        self.hide()
+
+    def restore_chart(self, instrument):
+        if instrument:
+            self.select_instrument(instrument)
+            quote = self.compact_ticker.quotes.get(instrument)
+            if quote and instrument not in self.compact_ticker.errors:
+                self.receive_ticker(quote)
+        self.worker.compact = False
+        self.show()
+        self.place_window()
+        self.raise_()
+        self.compact_ticker.hide()
 
     def toggle_top(self, enabled):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, enabled)
@@ -817,6 +1010,7 @@ class TickerWindow(QWidget):
 
     def closeEvent(self, event):
         logging.info("关闭窗口，停止行情请求")
+        self.compact_ticker.hide()
         self.status_timer.stop()
         self.worker.requestInterruption()
         self.worker.wait()
