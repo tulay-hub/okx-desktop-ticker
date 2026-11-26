@@ -31,6 +31,10 @@ API_BASE = "https://openapi.okx.com"
 INSTRUMENT = "NVDA-USDT-SWAP"
 ANTHROPIC = "ANTHROPIC-USDT-SWAP"
 COMPACT_INSTRUMENTS = (ANTHROPIC, INSTRUMENT)
+QUOTE_INTERVAL = 1
+CANDLE_INTERVAL = 10
+MENU_STYLE = ("QMenu {background:#182235; color:#eef2f7; padding:6px;}"
+              "QMenu::item {padding:6px 20px;} QMenu::item:selected {background:#2d3f59;}")
 GREEN = "#7ce5bc"
 RED = "#ff8f9c"
 MUTED = "#b0b9c9"
@@ -53,6 +57,16 @@ DISPLAY_NAMES = {
 
 def display_symbol(instrument):
     return "ANT" if instrument == ANTHROPIC else instrument.split("-")[0]
+
+
+def add_background_options(menu, window):
+    group = QActionGroup(menu)
+    for label, alpha in (("完全透明", 0), ("70% 透明", 77), ("半透明", 160), ("接近不透明", 230)):
+        action = menu.addAction(label)
+        action.setCheckable(True)
+        action.setChecked(alpha == window.background_alpha)
+        group.addAction(action)
+        action.triggered.connect(lambda checked, value=alpha: window.set_background(value))
 
 
 class InstrumentDialog(QDialog):
@@ -285,7 +299,7 @@ class MarketWorker(QThread):
                 if candle_request is not None and candle_request.done():
                     try:
                         self.candles.emit(candle_instrument, candle_request.result())
-                        next_candles = now + 30 if candle_instrument == instrument else 0
+                        next_candles = now + CANDLE_INTERVAL if candle_instrument == instrument else 0
                     except Exception:
                         next_candles = now + 10 if candle_instrument == instrument else 0
                     candle_request = None
@@ -313,7 +327,7 @@ class MarketWorker(QThread):
                 for symbol in watched:
                     if symbol not in ticker_requests and now >= next_ticker.get(symbol, 0):
                         ticker_requests[symbol] = pool.submit(get_ticker, symbol)
-                        next_ticker[symbol] = now + 2
+                        next_ticker[symbol] = now + QUOTE_INTERVAL
                 self.msleep(100)
 
 
@@ -518,6 +532,7 @@ class CompactTicker(QWidget):
     def __init__(self, settings):
         super().__init__(flags=Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.settings = settings
+        self.background_alpha = self.settings.value("compact_background_alpha", 160, type=int)
         self.drag_start = None
         self.dragging = False
         self.installEventFilter(self)
@@ -526,12 +541,10 @@ class CompactTicker(QWidget):
         self.quotes = {}
         self.errors = set()
         self.entries = {}
-        self.setObjectName("compactTicker")
-        self.setAttribute(Qt.WA_StyledBackground)
+        self.setAttribute(Qt.WA_TranslucentBackground)
         self.setStyleSheet(
-            "QWidget#compactTicker {background:#121c2c; border:1px solid #283a51;}"
             "QPushButton {background:transparent; color:#eef3fb; border:0; border-radius:4px;}"
-            "QPushButton:hover,QPushButton:focus {background:#253750;}"
+            "QPushButton:hover,QPushButton:focus {background:rgba(37,55,80,200);}"
             "QLabel {color:#eef3fb;}"
         )
         layout = QHBoxLayout(self)
@@ -539,7 +552,7 @@ class CompactTicker(QWidget):
         layout.setSpacing(4)
         expand = QPushButton("▤")
         expand.setFixedSize(26, 26)
-        expand.setToolTip("点击展开当前品种 K 线，按住拖动行情条")
+        expand.setToolTip("点击展开当前品种 K 线，按住拖动，右键调整透明度")
         expand.setAccessibleName("展开当前品种 K 线")
         expand.installEventFilter(self)
         expand.clicked.connect(lambda: self.expand_requested.emit(""))
@@ -619,6 +632,26 @@ class CompactTicker(QWidget):
             self.quotes[instrument] = quote
             self.errors.discard(instrument)
 
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(18, 28, 44, self.background_alpha))
+        painter.setPen(QPen(QColor(107, 131, 164, min(self.background_alpha, 64)), 1))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.setStyleSheet(MENU_STYLE)
+        add_background_options(menu, self)
+        menu.exec_(event.globalPos())
+        event.accept()
+
+    def set_background(self, alpha):
+        self.background_alpha = alpha
+        self.settings.setValue("compact_background_alpha", alpha)
+        self.settings.sync()
+        self.update()
+
     def refresh(self):
         for instrument, (button, price, change) in self.entries.items():
             quote = self.quotes.get(instrument)
@@ -638,7 +671,8 @@ class CompactTicker(QWidget):
                 change_text, color = "延迟" if status == "行情延迟" else "断线", "#f5cf84"
             change.setText(change_text)
             change.setStyleSheet(f"color:{color};")
-            button.setToolTip(f"点击展开 {display_symbol(instrument)} K 线 · {status} · 24 小时涨跌幅\n按住拖动行情条")
+            button.setToolTip(f"点击展开 {display_symbol(instrument)} K 线 · {status} · 24 小时涨跌幅\n"
+                              "按住拖动，右键调整透明度")
 
     def closeEvent(self, event):
         event.accept()
@@ -735,7 +769,7 @@ class TickerWindow(QWidget):
         self.status_label = self.label("● 正在连接…", 8, "#f5cf84")
         footer.addWidget(self.status_label)
         footer.addStretch()
-        footer.addWidget(self.label("2 秒刷新", 8, MUTED))
+        footer.addWidget(self.label(f"约 {QUOTE_INTERVAL} 秒刷新", 8, MUTED))
         layout.addLayout(footer)
         # Let the containing window receive drag and context-menu events.
         for child in self.findChildren(QLabel):
@@ -902,16 +936,8 @@ class TickerWindow(QWidget):
 
     def show_menu(self, position):
         menu = QMenu(self)
-        menu.setStyleSheet("QMenu {background:#182235; color:#eef2f7; padding:6px;}"
-                           "QMenu::item {padding:6px 20px;} QMenu::item:selected {background:#2d3f59;}")
-        opacity_menu = menu.addMenu("背景透明度")
-        group = QActionGroup(opacity_menu)
-        for label, alpha in (("完全透明", 0), ("70% 透明", 77), ("默认半透明", 160), ("接近不透明", 230)):
-            action = opacity_menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(alpha == self.background_alpha)
-            group.addAction(action)
-            action.triggered.connect(lambda checked, value=alpha: self.set_background(value))
+        menu.setStyleSheet(MENU_STYLE)
+        add_background_options(menu.addMenu("背景透明度"), self)
         top = menu.addAction("保持置顶")
         top.setCheckable(True)
         top.setChecked(bool(self.windowFlags() & Qt.WindowStaysOnTopHint))
@@ -1022,6 +1048,7 @@ class TickerWindow(QWidget):
 
 def main():
     parser = argparse.ArgumentParser(description="NVDAUSDT 透明桌面行情")
+    parser.add_argument("--compact", action="store_true", help="以精简行情条启动")
     parser.add_argument("--smoke-test", type=Path, help="读取至少三次行情后写入验证报告并退出")
     parser.add_argument("--snapshot", type=Path, help="验证模式下保存窗口截图")
     args = parser.parse_args()
@@ -1043,7 +1070,10 @@ def main():
     window = TickerWindow(args.smoke_test, args.snapshot)
     signal.signal(signal.SIGTERM, lambda signum, frame: window.close())
     signal.signal(signal.SIGINT, lambda signum, frame: window.close())
-    window.show()
+    if args.compact and not args.smoke_test:
+        window.show_compact()
+    else:
+        window.show()
     return app.exec_()
 
 
